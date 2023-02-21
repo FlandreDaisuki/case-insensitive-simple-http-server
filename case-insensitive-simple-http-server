@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+
+"""
+Modified from https://github.com/python/cpython/blob/714a93f6383042c1c12d9bdf2b5c2cdd7a72c20d/Lib/http/server.py
+"""
+
+import os
+import posixpath
+import socket # For gethostbyaddr()
+import sys
+import urllib.parse
+
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer, SimpleHTTPRequestHandler
+from pathlib import Path
+
+
+def case_insensitive_join(dirpath: str, basepath: str):
+    simple_joined = os.path.join(dirpath, basepath)
+    if not Path(simple_joined).exists():
+        for in_dir in os.listdir(dirpath):
+            if in_dir.lower() == basepath.lower():
+                return os.path.join(dirpath, in_dir)
+    return simple_joined
+
+class CaseInsensitiveSimpleHTTPRequestHandler(SimpleHTTPRequestHandler):
+    def translate_path(self, path):
+        """Translate a /-separated PATH to the local filename syntax.
+        Components that mean special things to the local file system
+        (e.g. drive or directory names) are ignored.  (XXX They should
+        probably be diagnosed.)
+        """
+        # abandon query parameters
+        path = path.split('?',1)[0]
+        path = path.split('#',1)[0]
+        # Don't forget explicit trailing slash when normalizing. Issue17324
+        trailing_slash = path.rstrip().endswith('/')
+        try:
+            path = urllib.parse.unquote(path, errors='surrogatepass')
+        except UnicodeDecodeError:
+            path = urllib.parse.unquote(path)
+        path = posixpath.normpath(path)
+        words = path.split('/')
+        words = filter(None, words)
+        path = self.directory
+        for word in words:
+            if os.path.dirname(word) or word in (os.curdir, os.pardir):
+                # Ignore components that are not a simple file/directory name
+                continue
+            path = case_insensitive_join(path, word)
+        if trailing_slash:
+            path += '/'
+        return path
+
+def _get_best_family(*address):
+    infos = socket.getaddrinfo(
+        *address,
+        type=socket.SOCK_STREAM,
+        flags=socket.AI_PASSIVE,
+    )
+    family, type, proto, canonname, sockaddr = next(iter(infos))
+    return family, sockaddr
+
+def test(HandlerClass=BaseHTTPRequestHandler,
+        ServerClass=ThreadingHTTPServer,
+        protocol="HTTP/1.0", port=8000, bind=None):
+  """Test the HTTP request handler class.
+  This runs an HTTP server on port 8000 (or the port argument).
+  """
+  ServerClass.address_family, addr = _get_best_family(bind, port)
+  HandlerClass.protocol_version = protocol
+  with ServerClass(addr, HandlerClass) as httpd:
+    host, port = httpd.socket.getsockname()[:2]
+    url_host = f'[{host}]' if ':' in host else host
+    print(
+        f"Serving HTTP on {host} port {port} "
+        f"(http://{url_host}:{port}/) ..."
+    )
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nKeyboard interrupt received, exiting.")
+        sys.exit(0)
+
+
+if __name__ == '__main__':
+    import argparse
+    import contextlib
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-b', '--bind', metavar='ADDRESS',
+                        help='bind to this address '
+                            '(default: all interfaces)')
+    parser.add_argument('-d', '--directory', default=os.getcwd(),
+                        help='serve this directory '
+                            '(default: current directory)')
+    parser.add_argument('-p', '--protocol', metavar='VERSION',
+                        default='HTTP/1.0',
+                        help='conform to this HTTP version '
+                            '(default: %(default)s)')
+    parser.add_argument('port', default=8000, type=int, nargs='?',
+                        help='bind to this port '
+                            '(default: %(default)s)')
+    args = parser.parse_args()
+
+    handler_class = CaseInsensitiveSimpleHTTPRequestHandler
+
+    # ensure dual-stack is not disabled; ref #38907
+    class DualStackServer(ThreadingHTTPServer):
+
+        def server_bind(self):
+            # suppress exception when protocol is IPv4
+            with contextlib.suppress(Exception):
+                self.socket.setsockopt(
+                    socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            return super().server_bind()
+
+        def finish_request(self, request, client_address):
+            self.RequestHandlerClass(request, client_address, self,
+                                    directory=args.directory)
+
+    test(
+        HandlerClass=handler_class,
+        ServerClass=DualStackServer,
+        port=args.port,
+        bind=args.bind,
+        protocol=args.protocol,
+    )
